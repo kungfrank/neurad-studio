@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Custom data parser for your own data format."""
+"""Data parser for Street Gaussians / Waymo-style data format."""
 
 from __future__ import annotations
 
@@ -33,10 +33,10 @@ from nerfstudio.utils.io import load_from_json
 
 
 @dataclass
-class MyDataParserConfig(DataParserConfig):
-    """Configuration for custom data parser."""
+class StreetGaussianDataParserConfig(DataParserConfig):
+    """Configuration for Street Gaussians data parser (Waymo-style format)."""
     
-    _target: Type = field(default_factory=lambda: MyDataParser)
+    _target: Type = field(default_factory=lambda: StreetGaussianDataParser)
     """Target class to instantiate."""
     
     scale_factor: float = 1.0
@@ -45,44 +45,63 @@ class MyDataParserConfig(DataParserConfig):
     scene_scale: float = 1.0
     """How much to scale the region of interest by."""
     
-    orientation_method: str = "pca"
+    orientation_method: str = "none"
     """The method to use for orientation. Options: pca, up, vertical, none."""
     
-    center_method: str = "poses"
+    center_method: str = "none"
     """The method to use to center the poses. Options: poses, focus, none."""
     
-    auto_scale_poses: bool = True
+    auto_scale_poses: bool = False
     """Whether to automatically scale the poses to fit in +/- 1 bounding box."""
     
     train_split_fraction: float = 0.9
     """The fraction of images to use for training. The remaining images are for eval."""
     
-    depth_unit_scale_factor: float = 1e-3
-    """Scales the depth values to meters. Default value is 0.001 for a millimeter to meter conversion."""
+    depth_unit_scale_factor: float = 1.0
+    """Scales the depth values to meters."""
+    
+    start_time: float = 0.0
+    """Start time for temporal sampling."""
+    
+    end_time: float = 1.0
+    """End time for temporal sampling."""
+    
+    cameras_to_use: List[str] = field(default_factory=lambda: ["CAM_FRONT", "CAM_FRONT_LEFT", "CAM_FRONT_RIGHT", "CAM_BACK_LEFT", "CAM_BACK_RIGHT"])
+    """List of camera names to use."""
 
 
 @dataclass  
-class MyDataParser(DataParser):
-    """Custom Data Parser.
+class StreetGaussianDataParser(DataParser):
+    """Street Gaussians Data Parser for Waymo-style data format.
     
-    This parser is designed to load your custom data format. You should modify the 
-    _generate_dataparser_outputs method to match your specific data structure.
+    This parser is designed to load Street Gaussians / Waymo Open Dataset format.
+    Expected data structure (similar to Street Gaussians preprocessing):
     
-    Expected data structure:
     data/
-    ├── transforms.json  # Contains camera poses and intrinsics
-    ├── images/          # Directory containing images
-    │   ├── image_001.jpg
-    │   ├── image_002.jpg
+    ├── transforms.json          # Contains camera poses, intrinsics, and metadata
+    ├── images/                  # Directory containing camera images
+    │   ├── 000/                 # Frame number
+    │   │   ├── CAM_FRONT.jpg
+    │   │   ├── CAM_FRONT_LEFT.jpg
+    │   │   ├── CAM_FRONT_RIGHT.jpg
+    │   │   ├── CAM_BACK_LEFT.jpg
+    │   │   └── CAM_BACK_RIGHT.jpg
+    │   ├── 001/
     │   └── ...
-    └── masks/ (optional) # Directory containing mask images
-        ├── mask_001.png
-        ├── mask_002.png
+    ├── masks/ (optional)        # Directory containing sky masks
+    │   ├── 000/
+    │   │   ├── CAM_FRONT.png
+    │   │   └── ...
+    │   └── ...
+    └── depths/ (optional)       # Directory containing depth maps
+        ├── 000/
+        │   ├── CAM_FRONT.npz
+        │   └── ...
         └── ...
     """
 
-    config: MyDataParserConfig
-    includes_time: bool = False  # Set to True if your data includes time information
+    config: StreetGaussianDataParserConfig
+    includes_time: bool = True  # Street Gaussians includes temporal information
 
     def _generate_dataparser_outputs(self, split: str = "train") -> DataparserOutputs:
         """Generate dataparser outputs for the given split.
@@ -102,106 +121,146 @@ class MyDataParser(DataParser):
         with open(transforms_file, "r") as f:
             meta = json.load(f)
         
-        # Extract camera intrinsics
-        if "camera_angle_x" in meta:
-            # If field of view is provided
-            camera_angle_x = meta["camera_angle_x"]
-        elif "fl_x" in meta:
-            # If focal length is provided directly
-            fl_x = meta["fl_x"]
-            fl_y = meta.get("fl_y", fl_x)
-        else:
-            raise ValueError("Camera intrinsics not found in transforms.json")
+        # Get camera information and frame data
+        cameras_info = meta.get("cameras", {})
+        frames = meta.get("frames", [])
         
-        # Extract image information
-        frames = meta["frames"]
-        image_filenames = []
-        poses = []
+        if not frames:
+            raise ValueError("No frames found in transforms.json")
         
-        # Process each frame
-        for frame in frames:
-            # Get image filename
-            fname = frame["file_path"]
-            if not fname.startswith("/"):
-                fname = self.config.data / fname
-            else:
-                fname = Path(fname)
+        # Temporal filtering based on start_time and end_time
+        total_frames = len(frames)
+        start_idx = int(self.config.start_time * total_frames)
+        end_idx = int(self.config.end_time * total_frames)
+        frames = frames[start_idx:end_idx]
+        
+        # Collect all camera data
+        all_image_filenames = []
+        all_poses = []
+        all_times = []
+        all_camera_types = []
+        all_fx = []
+        all_fy = []
+        all_cx = []
+        all_cy = []
+        all_heights = []
+        all_widths = []
+        all_distortion_params = []
+        
+        for frame_idx, frame in enumerate(frames):
+            frame_time = frame.get("time", frame_idx / len(frames))
             
-            # Check if image exists
-            if not fname.exists():
-                # Try with different extensions
-                for ext in [".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"]:
-                    fname_with_ext = fname.with_suffix(ext)
-                    if fname_with_ext.exists():
-                        fname = fname_with_ext
-                        break
-                else:
-                    print(f"Warning: Image {fname} not found, skipping...")
+            # Process each camera in the frame
+            for camera_name in self.config.cameras_to_use:
+                if camera_name not in frame.get("cameras", {}):
                     continue
-            
-            image_filenames.append(fname)
-            
-            # Get camera pose (transform matrix)
-            pose = np.array(frame["transform_matrix"])
-            poses.append(pose)
+                    
+                camera_data = frame["cameras"][camera_name]
+                
+                # Get image path
+                image_path = camera_data.get("image_path", f"images/{frame_idx:03d}/{camera_name}.jpg")
+                if not image_path.startswith("/"):
+                    image_path = self.config.data / image_path
+                else:
+                    image_path = Path(image_path)
+                
+                # Check if image exists
+                if not image_path.exists():
+                    # Try with different extensions
+                    for ext in [".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"]:
+                        img_with_ext = image_path.with_suffix(ext)
+                        if img_with_ext.exists():
+                            image_path = img_with_ext
+                            break
+                    else:
+                        print(f"Warning: Image {image_path} not found, skipping...")
+                        continue
+                
+                all_image_filenames.append(image_path)
+                
+                # Get camera pose (transform matrix)
+                pose = np.array(camera_data["transform_matrix"], dtype=np.float32)
+                all_poses.append(pose)
+                all_times.append(frame_time)
+                
+                # Get camera intrinsics - check camera-specific first, then global
+                camera_intrinsics = camera_data.get("intrinsics", cameras_info.get(camera_name, {}))
+                
+                # Extract intrinsic parameters
+                if "fx" in camera_intrinsics and "fy" in camera_intrinsics:
+                    fx = camera_intrinsics["fx"]
+                    fy = camera_intrinsics["fy"]
+                elif "camera_angle_x" in camera_intrinsics:
+                    # Load image to get dimensions for FOV calculation
+                    sample_image = Image.open(image_path)
+                    width, height = sample_image.size
+                    camera_angle_x = camera_intrinsics["camera_angle_x"]
+                    fx = fy = 0.5 * width / np.tan(0.5 * camera_angle_x)
+                else:
+                    # Default values if not specified
+                    sample_image = Image.open(image_path)
+                    width, height = sample_image.size
+                    fx = fy = width * 0.7  # Reasonable default
+                
+                cx = camera_intrinsics.get("cx", sample_image.size[0] / 2.0)
+                cy = camera_intrinsics.get("cy", sample_image.size[1] / 2.0)
+                
+                all_fx.append(fx)
+                all_fy.append(fy)
+                all_cx.append(cx)
+                all_cy.append(cy)
+                
+                # Get image dimensions
+                if 'sample_image' not in locals():
+                    sample_image = Image.open(image_path)
+                width, height = sample_image.size
+                all_widths.append(width)
+                all_heights.append(height)
+                
+                # Handle distortion parameters
+                distortion = camera_intrinsics.get("distortion", {})
+                if distortion:
+                    k1 = distortion.get("k1", 0.0)
+                    k2 = distortion.get("k2", 0.0)
+                    k3 = distortion.get("k3", 0.0)
+                    k4 = distortion.get("k4", 0.0)
+                    p1 = distortion.get("p1", 0.0)
+                    p2 = distortion.get("p2", 0.0)
+                    all_distortion_params.append([k1, k2, k3, k4, p1, p2])
+                    all_camera_types.append(CameraType.OPENCV)
+                else:
+                    all_distortion_params.append([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+                    all_camera_types.append(CameraType.PERSPECTIVE)
         
-        poses = np.array(poses).astype(np.float32)
-        image_filenames = [Path(f) for f in image_filenames]
-        
-        # Load a sample image to get dimensions
-        if image_filenames:
-            sample_image = Image.open(image_filenames[0])
-            image_width, image_height = sample_image.size
-        else:
+        if not all_image_filenames:
             raise ValueError("No valid images found")
         
-        # Create camera intrinsics
-        if "camera_angle_x" in meta:
-            # Calculate focal length from field of view
-            focal_length = 0.5 * image_width / np.tan(0.5 * camera_angle_x)
-            fx = fy = focal_length
+        # Convert to tensors
+        num_images = len(all_image_filenames)
+        fx_tensor = torch.tensor(all_fx, dtype=torch.float32)
+        fy_tensor = torch.tensor(all_fy, dtype=torch.float32)
+        cx_tensor = torch.tensor(all_cx, dtype=torch.float32)
+        cy_tensor = torch.tensor(all_cy, dtype=torch.float32)
+        height_tensor = torch.tensor(all_heights, dtype=torch.int32)
+        width_tensor = torch.tensor(all_widths, dtype=torch.int32)
+        
+        # Convert poses to torch tensors (assume 4x4, take 3x4)
+        poses_array = np.array(all_poses)
+        if poses_array.shape[-1] == 4 and poses_array.shape[-2] == 4:
+            poses_tensor = torch.from_numpy(poses_array[:, :3, :4]).float()
         else:
-            fx = fl_x
-            fy = fl_y
-            
-        cx = meta.get("cx", image_width / 2.0)
-        cy = meta.get("cy", image_height / 2.0)
+            poses_tensor = torch.from_numpy(poses_array).float()
         
-        # Handle distortion parameters (if available)
-        distortion_params = None
-        camera_type = CameraType.PERSPECTIVE
+        # Handle distortion parameters
+        distortion_tensor = None
+        if any(any(dist) for dist in all_distortion_params):
+            distortion_tensor = torch.tensor(all_distortion_params, dtype=torch.float32)
         
-        if "k1" in meta or "k2" in meta:
-            # Radial distortion parameters
-            k1 = meta.get("k1", 0.0)
-            k2 = meta.get("k2", 0.0)
-            k3 = meta.get("k3", 0.0)
-            k4 = meta.get("k4", 0.0)
-            p1 = meta.get("p1", 0.0)
-            p2 = meta.get("p2", 0.0)
-            distortion_params = torch.tensor([k1, k2, k3, k4, p1, p2], dtype=torch.float32)
-            camera_type = CameraType.OPENCV
+        # Assume all cameras have same type for simplicity
+        camera_type = all_camera_types[0] if all_camera_types else CameraType.PERSPECTIVE
         
-        # Create camera intrinsics tensor
-        num_images = len(image_filenames)
-        fx_tensor = torch.full((num_images,), fx, dtype=torch.float32)
-        fy_tensor = torch.full((num_images,), fy, dtype=torch.float32)
-        cx_tensor = torch.full((num_images,), cx, dtype=torch.float32)
-        cy_tensor = torch.full((num_images,), cy, dtype=torch.float32)
-        
-        # Create height and width tensors
-        height_tensor = torch.full((num_images,), image_height, dtype=torch.int32)
-        width_tensor = torch.full((num_images,), image_width, dtype=torch.int32)
-        
-        # Handle distortion
-        if distortion_params is not None:
-            distortion_params = distortion_params.repeat(num_images, 1)
-        
-        # Convert poses to torch tensors
-        poses_tensor = torch.from_numpy(poses[:, :3, :4]).float()
-        
-        # Apply transforms if needed (e.g., coordinate system conversion)
-        # poses_tensor = self._apply_coordinate_transform(poses_tensor)
+        # Create times tensor for temporal data
+        times_tensor = torch.tensor(all_times, dtype=torch.float32)
         
         # Create cameras object
         cameras = Cameras(
@@ -213,7 +272,8 @@ class MyDataParser(DataParser):
             width=width_tensor,
             camera_to_worlds=poses_tensor,
             camera_type=camera_type,
-            distortion_params=distortion_params,
+            distortion_params=distortion_tensor,
+            times=times_tensor,
         )
         
         # Apply auto-scaling if enabled
@@ -230,35 +290,56 @@ class MyDataParser(DataParser):
             indices = indices[num_train:]
         
         # Filter data for the split
-        image_filenames = [image_filenames[i] for i in indices]
+        image_filenames = [all_image_filenames[i] for i in indices]
         cameras = cameras[indices]
         
-        # Check for mask files
+        # Check for mask files (sky masks)
         mask_filenames = None
         mask_dir = self.config.data / "masks"
         if mask_dir.exists():
             mask_filenames = []
-            for fname in image_filenames:
-                # Create corresponding mask filename
-                mask_fname = mask_dir / fname.name.replace(fname.suffix, ".png")
-                if mask_fname.exists():
-                    mask_filenames.append(mask_fname)
+            for img_path in image_filenames:
+                # Extract frame number and camera name from path
+                # Expected: images/000/CAM_FRONT.jpg -> masks/000/CAM_FRONT.png
+                relative_path = img_path.relative_to(self.config.data / "images")
+                mask_path = mask_dir / relative_path.with_suffix(".png")
+                
+                if mask_path.exists():
+                    mask_filenames.append(mask_path)
                 else:
-                    mask_filenames.append(None)  # No mask for this image
+                    mask_filenames.append(None)
         
-        # Create scene box
+        # Check for depth files
+        depth_filenames = None
+        depth_dir = self.config.data / "depths"
+        if depth_dir.exists():
+            depth_filenames = []
+            for img_path in image_filenames:
+                # Extract frame number and camera name from path
+                # Expected: images/000/CAM_FRONT.jpg -> depths/000/CAM_FRONT.npz
+                relative_path = img_path.relative_to(self.config.data / "images")
+                depth_path = depth_dir / relative_path.with_suffix(".npz")
+                
+                if depth_path.exists():
+                    depth_filenames.append(depth_path)
+                else:
+                    depth_filenames.append(None)
+        
+        # Create scene box - for Street Gaussians, use larger scale for outdoor scenes
+        scene_scale = self.config.scene_scale
         scene_box = SceneBox(
             aabb=torch.tensor(
-                [[-self.config.scene_scale, -self.config.scene_scale, -self.config.scene_scale],
-                 [self.config.scene_scale, self.config.scene_scale, self.config.scene_scale]],
+                [[-scene_scale, -scene_scale, -scene_scale/2],  # Smaller vertical range
+                 [scene_scale, scene_scale, scene_scale]],
                 dtype=torch.float32,
             )
         )
         
         # Prepare metadata
         metadata = {
-            "depth_filenames": None,  # Add depth filenames if available
+            "depth_filenames": depth_filenames,
             "depth_unit_scale_factor": self.config.depth_unit_scale_factor,
+            "camera_names": self.config.cameras_to_use,
         }
         
         # Add any custom metadata from your data format
